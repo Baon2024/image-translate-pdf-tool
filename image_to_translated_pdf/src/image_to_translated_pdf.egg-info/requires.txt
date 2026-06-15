@@ -1,0 +1,7 @@
+keyring
+google-genai
+pydantic
+python-dotenv
+reportlab
+rich
+tqdm

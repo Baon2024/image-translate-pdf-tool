@@ -1,0 +1,2 @@
+[console_scripts]
+image-translate-pdf = image_to_translated_pdf.main:main

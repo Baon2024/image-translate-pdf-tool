@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "image_to_translated_pdf"
+version = "0.1.0"
+dependencies = [
+  "keyring",
+  "google-genai",
+  "pydantic",
+  "python-dotenv",
+  "reportlab",
+  "rich",
+  "tqdm"
+]
+
+[project.scripts]
+image-translate-pdf = "image_to_translated_pdf.main:main"
