@@ -14,8 +14,10 @@ from reportlab.platypus import ListFlowable, ListItem, PageBreak, Paragraph, Sim
 import argparse
 from rich.console import Console
 from tqdm import tqdm
+from .basic_rate_limiter import rate_limiter
 import keyring
 import getpass
+import asyncio
 
 
 load_dotenv()
@@ -210,6 +212,8 @@ def call_gemini_structured_output_batch(batch_waitlist, response_model, model_na
 
     ## need to use a variant of translationResult, that handles multiple pages
 
+    
+
     response = client.models.generate_content(
         model=model_name,
         contents=contents,
@@ -253,7 +257,7 @@ def find_image_directory(imagesCollectionPath):
     return dir_full_path
 
 
-def core_batch_retry_handler(batch_waitlist, token_usage, current_batch_number, model, language, retries_allowed, run_usage, client):
+async def core_batch_retry_handler(index, batch_waitlist, token_usage, current_batch_number, model, language, retries_allowed, run_usage, client, free_tier_llm):
     
     translated_text_local = []
     num_of_tries = retries_allowed
@@ -261,7 +265,10 @@ def core_batch_retry_handler(batch_waitlist, token_usage, current_batch_number, 
     for attempt in range(1, num_of_tries + 1):
             if attempt > 1:
                 console.print(f"[yellow].. text extraction and translation for batch {current_batch_number} return None - retrying for the {attempt} time.. [/yellow]")
-            extracted_and_translated_text_result = call_gemini_structured_output_batch(batch_waitlist, TranslationResultBatch, model, language, client)
+            
+            if free_tier_llm:
+                await rate_limiter(10)
+            extracted_and_translated_text_result = await asyncio.to_thread(call_gemini_structured_output_batch, batch_waitlist, TranslationResultBatch, model, language, client)
             #print(f"extracted and translated text for batch {current_batch_number} is: {extracted_and_translated_text_result['response']}")
 
             run_usage.append({
@@ -281,64 +288,83 @@ def core_batch_retry_handler(batch_waitlist, token_usage, current_batch_number, 
             if extracted_and_translated_text_result["response"] is not None:
                 translated_text_local.extend(extracted_and_translated_text_result["response"])
                 #print(f"extracted and translated text for batch {current_batch_number} is: {extracted_and_translated_text_result['response']}")
-                return translated_text_local, failed_after_retries    
+                return { "page_number": index, "translated_text": translated_text_local, "failed_after_retries": failed_after_retries }    
         
     #print(f"failed to extract and translate batch {current_batch_number} after {num_of_tries} attempts: - ending translation run..
     # ")
     failed_after_retries = True
-    return translated_text_local, failed_after_retries
+    return { "page_number": index, "translated_text": translated_text_local, "failed_after_retries": failed_after_retries } 
 
-def extract_text_and_translate_batch(images_to_convert, token_usage, batch_size, model, language, retries_allowed, run_usage, client):
+async def extract_text_and_translate_batch(images_to_convert, token_usage, batch_size, model, language, retries_allowed, run_usage, client, free_tier_llm):
     
     current_batch_number = 0
     current_batch_total = 0 ## count each
     batch_waitlist = [] ## store waiting batches here
     translated_text = []
-    failed_after_retries = False 
+    failed_after_retries = False
+
+    ## need to switch this to asyncio.gather
+    batch_tasks = [] 
 
     for i, image in enumerate(tqdm(images_to_convert)):
         if current_batch_total == batch_size:
             ## translate existing batch group
             current_batch_number += 1
-            result, failed_after_retries = core_batch_retry_handler(batch_waitlist, token_usage, current_batch_number, model, language, retries_allowed, run_usage, client)
+            ## add to batch_tasks instead
+            batch_tasks.append(core_batch_retry_handler(i, batch_waitlist, token_usage, current_batch_number, model, language, retries_allowed, run_usage, client, free_tier_llm))
             batch_waitlist = []
-            if failed_after_retries:
-                return translated_text, failed_after_retries
-            translated_text.extend(result)
             batch_waitlist.append(image)
             current_batch_total = 1
         else:
             batch_waitlist.append(image)
             current_batch_total += 1
-
-        ## but last batch will always be short of batch number ??
-    ## so, if current_batch_total ? 0 on last batch, call
     if current_batch_total > 0:
         ## translate existing batch group
         current_batch_number += 1
-        result, failed_after_retries = core_batch_retry_handler(batch_waitlist, token_usage, current_batch_number, model, language, retries_allowed, run_usage, client)
-        if failed_after_retries:
-                return translated_text, failed_after_retries
-        translated_text.extend(result)
+        batch_tasks.append(core_batch_retry_handler(i, batch_waitlist, token_usage, current_batch_number, model, language, retries_allowed, run_usage, client, free_tier_llm))
         current_batch_total = 0 ## reset batches in waitlist, for next batch
     
-    return translated_text, failed_after_retries
+
+    ## then call the tasks
+    #task_results = await asyncio.gather(*batch_tasks)
+    task_results = [] #await asyncio.gather(*tasks)
+    ## change so can track
+    for finished_task in tqdm(asyncio.as_completed(batch_tasks), total=len(batch_tasks), desc="Translating pages"):
+        result = await finished_task
+        task_results.append(result)
+
+    task_results.sort(key=lambda task: task["page_number"])    
 
 
-def extract_text_and_translate(images_to_convert, token_usage, model, language, retries_allowed, run_usage, client):
-    translated_text = []
-    failed_after_retries  = False
+    translated_text = [chunk for text in task_results for chunk in text.get("translated_text", [])]
+    retry_failures_exist = any(task.get("failed_after_retries", None) is True for task in task_results)
+    partial_translation = any(text is None for text in translated_text)
 
-    for i, image in enumerate(tqdm(images_to_convert)):
-        num_of_tries = retries_allowed
+    if retry_failures_exist or partial_translation:
+        failed_after_retries = True
+        return translated_text, failed_after_retries
+    else:
+        failed_after_retries = False
+        return translated_text, failed_after_retries
+
+    
+
+
+
+async def extract_text_and_translate_concurrent_functionality(i, image, TranslationResult, model, language, client, num_of_tries, free_tier_llm):
+        
+        
+
         for attempt in range(1, num_of_tries + 1):
                 if attempt > 1:
                     console.print(f"[yellow].. text extraction and translation for page {i} return None - retrying for the {attempt} time.. [/yellow]")
                 
-                extracted_and_translated_text_result = call_gemini_structured_output(image, TranslationResult, model, language, client)
+                if free_tier_llm:
+                    await rate_limiter(10)
+                extracted_and_translated_text_result = await asyncio.to_thread(call_gemini_structured_output, image, TranslationResult, model, language, client)
                 #print(f"extracted and translated text for image {i} is: {extracted_and_translated_text_result['response']}")
                 
-                run_usage.append({
+                run_usage = {
                     "mode": "single",          # or "batch"
                     "page": i,
                     "batch": None,
@@ -348,22 +374,55 @@ def extract_text_and_translate(images_to_convert, token_usage, model, language, 
                     "output_tokens": extracted_and_translated_text_result.get("output_tokens", 0),
                     "thought_tokens": extracted_and_translated_text_result.get("thought_tokens", 0),
                     "total_tokens": extracted_and_translated_text_result.get("total_tokens", 0),
-                })
+                }
 
                 if extracted_and_translated_text_result["response"] is not None:
-                    translated_text.append(extracted_and_translated_text_result["response"])
+                    failed_after_retries = False
+                    return { "page_number": i, "translated_text": extracted_and_translated_text_result["response"], "failed_after_retries": failed_after_retries, "run_usage": run_usage } 
                     #print(f"extracted and translated text for image {i} is: {extracted_and_translated_text_result['response']}")
-                    break
                 else:
                     if attempt < 3:
                         console.print("[red].. GEMINI LLM call did not return a response - will re try ..[/red]")
         else:
             console.print("[red].. GEMINI LLM call did not return a response - ran out of retries[/red]")
             failed_after_retries = True
-            return translated_text, failed_after_retries
-                
-    #print(f"failed to extract and translate page {i} after {num_of_tries} attempts: {image} - ending translation run..")        
-    return translated_text, failed_after_retries                    
+            run_usage = None
+            return {"page_number": i, "translated_text": None, "failed_after_retries": failed_after_retries, "run_usage": run_usage }
+
+
+async def extract_text_and_translate(images_to_convert, token_usage, model, language, retries_allowed, run_usage, client, free_tier_llm):
+    
+    
+
+    ## need to switch to concurrent
+
+    tasks = []
+
+    for i, image in enumerate(tqdm(images_to_convert)):
+        tasks.append(extract_text_and_translate_concurrent_functionality(i, image, TranslationResult, model, language, client, retries_allowed, free_tier_llm))
+    
+    task_results = [] #await asyncio.gather(*tasks)
+    ## change so can track
+    for finished_task in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Translating pages"):
+        result = await finished_task
+        task_results.append(result)
+    
+    ## asyncio.as_completed returns task in order of completion, not order of pages, so needs to be sorted afterwards
+    task_results.sort(key=lambda task: task["page_number"])
+
+    ## then extract each
+    translated_text = [text.get("translated_text", []) for text in task_results]
+    partial_translation = any(task.get("translated_text", None) is None for task in task_results)
+    failed = any((task.get('failed_after_retries')) is True for task in task_results)
+
+    if failed or partial_translation:
+        failed_after_retries = True
+        return translated_text, failed_after_retries
+    else:
+        failed_after_retries = False
+        return translated_text, failed_after_retries
+
+                    
 
 
 
@@ -412,22 +471,51 @@ def validation_gemini_api_key_loop():
                 console.print("[yellow].. Ending current run ..[/yellow]")
                 sys.exit(1)
             else:
-                api_key = Prompt.ask("Please enter a Gemini api key",
-                          password=True).strip()
+                api_key = Prompt.ask("Please enter a Gemini api key").strip()
 
 
+def change_api_key():
 
-def main():
+    ## get current key, if it exists
+    console.print("[yellow].. Checking if you have a current api key ..[/yellow]")
+    curr_api_key = keyring.get_password('images_to_translated_pdf', "GEMINI_API_KEY")
+    if curr_api_key:
+        console.print(f"[yellow].. your current Gemini api key is: {curr_api_key} ..[/yellow]")
+    
+    ## get new api key
+    api_key = Prompt.ask("Please enter a Gemini api key").strip()
+    
+    while True:
+        client = get_gemini_client(api_key)
+        validation_check = validate_gemini(client)
+        if validation_check:
+            ## update saved keychain and return authenticated client
+            keyring.set_password("images_to_translated_pdf", "GEMINI_API_KEY", api_key)
+            console.print("[yellow].. New Api Key saved! ..[/yellow]")
+            return
+        else:
+            answer = Prompt.ask("The api_key you entered isn't a valid Gemini key. Please choose your option: ",
+                     choices=["Retry", "Abort"])
+            if answer == "Abort":
+                console.print("[yellow].. Ending current run ..[/yellow]")
+                sys.exit(1)
+            else:
+                api_key = Prompt.ask("Please enter a Gemini api key").strip()
+
+
+async def async_main():
 
 
     ## add in all argument parser stuff:
     parser = argparse.ArgumentParser(description="Assemble images of a physical article or PhD into a .pdf, and translate into English")
     parser.add_argument("--model", default="gemini-2.5-flash")
-    parser.add_argument("--image_directory", required=True)
-    parser.add_argument("--pdf_path", required=True)
-    parser.add_argument("--language", required=True, type=str)
+    parser.add_argument("--image_directory")
+    parser.add_argument("--pdf_path")
+    parser.add_argument("--language", type=str)
     parser.add_argument("--batches", default=1, type=int)
     parser.add_argument("--retries_allowed", default=3, type=int)
+    parser.add_argument("--change_api_key", action="store_true")
+    parser.add_argument("--free_tier_llm", default=True, type=bool)
 
     run_usage = []
     footnotes = []
@@ -435,8 +523,21 @@ def main():
     args = parser.parse_args()
 
     
-    client = validation_gemini_api_key_loop()
+
+    if args.change_api_key:
+        change_api_key() ## do code for this, then return
+        sys.exit(1)
+    
+
+
+    ## otherwise, check all fields that need to be required were provided
+    required_args_missing = [name for name in ("image_directory", "language", "pdf_path") if getattr(args, name) is None]
+    if required_args_missing:
+        sys.exit(1)
+        console.print(f"[red].. required flags for CLI were missing: {required_args_missing} ..[/red]")
+
     ## need to pass client down to LLM calls
+    client = validation_gemini_api_key_loop()
 
     ## add in BATCHE_PAGES, conditional based on batch_size - default 1, if above 1 then should be True
     BATCH_PAGES = None
@@ -481,7 +582,7 @@ def main():
     if BATCH_PAGES:
         # batch pages function
         console.print("[green].. User has chosen to batch images ..[/green]")
-        translated_text, failed_after_retries = extract_text_and_translate_batch(images_to_convert, token_usage, args.batches, args.model, args.language, args.retries_allowed, run_usage, client) ## pass batch size
+        translated_text, failed_after_retries = await extract_text_and_translate_batch(images_to_convert, token_usage, args.batches, args.model, args.language, args.retries_allowed, run_usage, client, args.free_tier_llm) ## pass batch size
         if failed_after_retries:
             console.print("[red].. translation failed after retries ..[/red]")
             sys.exit(1)
@@ -489,7 +590,7 @@ def main():
     else:
         ## existing version
         console.print("[green].. User has chosen default batch size of 1 ..[/green]")
-        translated_text, failed_after_retries = extract_text_and_translate(images_to_convert, token_usage, args.model, args.language, args.retries_allowed, run_usage, client)
+        translated_text, failed_after_retries = await extract_text_and_translate(images_to_convert, token_usage, args.model, args.language, args.retries_allowed, run_usage, client, args.free_tier_llm)
         if failed_after_retries:
             console.print("[red].. translation failed after retries ..[/red]")
             sys.exit(1)
@@ -697,7 +798,13 @@ def main():
     console.print("[green]... PDF Ready... [/green]")
     console.print(f"[green]... New PDF saved to: {args.pdf_path}... [/green]")
 
+
+def main():
+    asyncio.run(async_main())
+
 if __name__ == "__main__":
     main()
+
+
 
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "image_to_translated_pdf"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
   "keyring",
   "google-genai",

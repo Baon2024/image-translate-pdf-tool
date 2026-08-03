@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: image_to_translated_pdf
-Version: 0.1.0
+Version: 0.1.2
 Requires-Dist: keyring
 Requires-Dist: google-genai
 Requires-Dist: pydantic
