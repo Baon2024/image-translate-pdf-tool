@@ -3,6 +3,8 @@ pyproject.toml
 src/image_to_translated_pdf/__init__.py
 src/image_to_translated_pdf/basic_rate_limiter.py
 src/image_to_translated_pdf/main.py
+src/image_to_translated_pdf/pdf_main_functionality.py
+src/image_to_translated_pdf/shared_helper_functions.py
 src/image_to_translated_pdf.egg-info/PKG-INFO
 src/image_to_translated_pdf.egg-info/SOURCES.txt
 src/image_to_translated_pdf.egg-info/dependency_links.txt

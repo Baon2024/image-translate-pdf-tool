@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: image_to_translated_pdf
-Version: 0.1.2
+Version: 0.1.11
 Requires-Dist: keyring
 Requires-Dist: google-genai
 Requires-Dist: pydantic
@@ -8,3 +8,4 @@ Requires-Dist: python-dotenv
 Requires-Dist: reportlab
 Requires-Dist: rich
 Requires-Dist: tqdm
+Requires-Dist: PyMuPDF

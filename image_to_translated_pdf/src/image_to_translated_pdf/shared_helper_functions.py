@@ -1,25 +1,14 @@
 from pathlib import Path
-import sys
 from google import genai
 from google.genai import types
 from ollama import chat
 from pydantic import Field, BaseModel
 from typing import List, Any
 from dotenv import load_dotenv
-import json
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-from reportlab.lib.units import cm
-from reportlab.platypus import ListFlowable, ListItem, PageBreak, Paragraph, SimpleDocTemplate, Spacer
-import argparse
 from rich.console import Console
 from tqdm import tqdm
 from .basic_rate_limiter import rate_limiter
-import keyring
-import getpass
 import asyncio
-from .pdf_main_functionality import rest_of_functionality
-from .shared_helper_functions import Footnote, TranslationResult, TranslationResultBatch
 import fitz
 
 load_dotenv()
@@ -62,6 +51,49 @@ def infer_page_numbers(ready_to_assemble):
     return inferred
 
 
+class Footnote(BaseModel):
+    number: int | None = Field(
+        default=None,
+        description="The footnote number, if the footnote has one. If it doesn't have one, because it's continuing a footnote from a previous page, don't return this."
+    )
+    footnote_text: str = Field(
+        ...,
+        description="the text of the footnote"
+    )
+    continuation_previous_footnote: bool = Field(
+        ...,
+        description="If the footnote is continuing a previous footnote from a previous page, and doesn't have footnote number, return True. Otherwise, return False"
+    )
+    continuation_previous_footnote_number: int | None = Field(
+        default=None,
+        description="If the footnote is continuting a previous footnote, return what the footnote number must be - (whatever the next numbered footnote is, minus 1, will give you the footnote number it must be continuing)"
+    )
+    ## add in what the previous footnumber must have been - based on what the next one is
+
+class TranslationResult(BaseModel):
+    title: str | None = Field(
+        default=None,
+        description="if the title of the article or PhD is on this page in the image, return it. Otherwise, leave this blank. If you return a title, don't return it's text in the translated_main_text section. The title is usually found in the main part of the page, but separate to the main text body."
+    )
+    page_number: int | None = Field(
+        ...,
+        description="the page number of the article page in the image. If no page number is visible, return. The article name or author name at the top of the page does not count as main text."
+    )
+    translated_main_text: str = Field(
+        default="",
+        description="the main text of the image. Do not return the title in this."
+        )
+    translated_footnotes: List[Footnote] | None = Field(
+        default_factory=list,
+        description="the footnotes of the main text, if they exist in the image"
+        )
+
+class TranslationResultBatch(BaseModel):
+    pages: list[TranslationResult] = Field(
+        ...,
+        description="pages are a list of TranslationResult class, one per image/page"
+    )
+
 
 def token_count(value):
     return value if value is not None else 0
@@ -76,9 +108,19 @@ def usage_token_count(usage, attribute):
 def ensure_pydantic_schema(content, pydantic_model, data_type):
 
     def normalize(item):
-        if isinstance(item, BaseModel):
-            item = item.model_dump()
-        return pydantic_model.model_validate(item)
+        page = pydantic_model.model_validate(item)
+
+        if hasattr(page, "translated_footnotes"):
+            page.translated_footnotes = [
+                note if isinstance(note, Footnote) else Footnote.model_validate(note)
+                for note in (page.translated_footnotes or [])
+            ]
+            print("normalized footnote types:", [
+                type(note) for note in (page.translated_footnotes or [])
+            ])
+
+
+        return page
 
 
     if data_type == "single":
@@ -115,16 +157,6 @@ def call_gemini_structured_output(image, response_model, model_name, language, c
   - continuation_previous_footnote_number: 56
     """ ## need to actually add this in, stupid
 
-    if isinstance(image, dict):
-        print("mode used for mime_type and data passing is pdf")
-        mime_type = image["suffix"].lower()
-        data = image["bytes"]
-    else:
-        print("mode used for mime_type and data passing is images")
-        mime_type = image.suffix.lower()
-        data = image.read_bytes()
-    
-
     mime_types_dict = {
         ".png": "image/png",
         ".jpg": "image/jpeg",
@@ -133,12 +165,20 @@ def call_gemini_structured_output(image, response_model, model_name, language, c
     }
 
     contents = []
-    
-    
-        
-    contents.append(types.Part.from_bytes(data=data, mime_type=mime_types_dict[mime_type]))    
-    
-    
+
+    if isinstance(image, dict):
+        print("mode used for mime_type and data passing is pdf")
+        mime_type = image["suffix"].lower()
+        data = image["bytes"]
+        page_num = image["page_num"]
+
+    else:
+        print("mode used for mime_type and data passing is images")
+        mime_type = image.suffix.lower()
+        data = image.read_bytes()
+
+    contents.append(types.Part.from_bytes(data=data, mime_type=mime_types_dict[mime_type]))
+
     contents.append(f"Extract the text from this image, translate from {language} into English, and return in the format specified.")
     
 
@@ -159,6 +199,9 @@ def call_gemini_structured_output(image, response_model, model_name, language, c
     #print("Total tokens:", usage.total_token_count)
 
     ## need to ensure i track token costs - so i get a baseline for now.
+    print(f"response.parsed before checking it matches pydantic schema: {response.parsed}")
+    if isinstance(image, dict):
+        print(f"for page number: {page_num}")
     
     response_parsed = ensure_pydantic_schema(response.parsed, TranslationResult, "single")
     return { "response": response_parsed, "input_tokens": usage_token_count(usage, "prompt_token_count"), "output_tokens": usage_token_count(usage, "candidates_token_count"), "total_tokens": usage_token_count(usage, "total_token_count"), "thought_tokens": usage_token_count(usage, "thoughts_token_count") }  # should return correctly
@@ -199,12 +242,11 @@ def call_gemini_structured_output_batch(batch_waitlist, response_model, model_na
         ".webp": "image/webp",
     }
 
-    
-
     ## need to check if it's pdf or image version
     for image in batch_waitlist:
         if isinstance(image, dict):
             print("mode used for mime_type and data passing is pdf")
+            ## then it's images form a pdf
             mime_type = image["suffix"].lower()
             data = image["bytes"]
             image_waitlist.append(types.Part.from_bytes(data=data, mime_type=mime_types_dict[mime_type]))
@@ -212,8 +254,8 @@ def call_gemini_structured_output_batch(batch_waitlist, response_model, model_na
             print("mode used for mime_type and data passing is images")
             mime_type = image.suffix.lower()
             data = image.read_bytes()
-            image_waitlist.append(types.Part.from_bytes(data=data, mime_type=mime_type))
-        
+            image_waitlist.append(types.Part.from_bytes(data=data, mime_type=mime_types_dict[mime_type]))
+    
 
     contents = []
     contents.extend(image_waitlist)
@@ -306,14 +348,13 @@ def get_images_from_pdf(pdf_path):
         #buffer = io.BytesIO()
         #img.save(buffer, format="JPEG")
         #new_imag = Image.open(io.BytesIO(buffer))
-        converted_pages.append({ "bytes": pix.tobytes("jpeg"), "filename": f"_page_{pagenumber}.jpeg","suffix": ".jpeg", "page_num": pagenumber + 1 })
+        converted_pages.append({ "bytes": pix.tobytes("jpeg"), "filename": f"_page_{pagenumber}.jpeg", "suffix": ".jpeg", "page_num": pagenumber + 1 })
         ## stays as bytes - will need to change existing version to have something very similar
 
         ## for testing
         #re_img = Image.open(buffer)
         #print(re_img.format)
     return converted_pages
-
 
 
 
@@ -572,428 +613,4 @@ def validate_gemini(client):
         return True
     except Exception as e:
         return False
-
-
-from rich.prompt import Confirm, Prompt
-
-def validation_gemini_api_key_loop():
-    console.print("[yellow].. Checking Gemini key is valid ..[/yellow]")
-
-
-    api_key = keyring.get_password('images_to_translated_pdf', "GEMINI_API_KEY")
-
-
-    while True:
-        if api_key:
-            console.print("[green].. GEMINI_API_KEY already saved to keyring - will use this .. [/green]")
-        else:
-            console.print("[yellow].. no existing GEMINI_API_KEY saved to keyring - you need to provide one .. [/yellow]")
-            api_key = getpass.getpass("Enter your gemini api key: ").strip()
-        client = get_gemini_client(api_key)
-        validation_check = validate_gemini(client)
-        if validation_check:
-            ## update saved keychain and return authenticated client
-            keyring.set_password("images_to_translated_pdf", "GEMINI_API_KEY", api_key)
-            return client
-        else:
-            ## ask user for new key or to exist
-            answer = Prompt.ask("The api_key you entered isn't a valid Gemini key. Please choose your option: ",
-                     choices=["Retry", "Abort"])
-            if answer == "Abort":
-                console.print("[yellow].. Ending current run ..[/yellow]")
-                sys.exit(1)
-            else:
-                api_key = Prompt.ask("Please enter a Gemini api key").strip()
-
-
-def change_api_key():
-
-    ## get current key, if it exists
-    console.print("[yellow].. Checking if you have a current api key ..[/yellow]")
-    curr_api_key = keyring.get_password('images_to_translated_pdf', "GEMINI_API_KEY")
-    if curr_api_key:
-        console.print(f"[yellow].. your current Gemini api key is: {curr_api_key} ..[/yellow]")
-    
-    ## get new api key
-    api_key = Prompt.ask("Please enter a Gemini api key").strip()
-    
-    while True:
-        client = get_gemini_client(api_key)
-        validation_check = validate_gemini(client)
-        if validation_check:
-            ## update saved keychain and return authenticated client
-            keyring.set_password("images_to_translated_pdf", "GEMINI_API_KEY", api_key)
-            console.print("[yellow].. New Api Key saved! ..[/yellow]")
-            return
-        else:
-            answer = Prompt.ask("The api_key you entered isn't a valid Gemini key. Please choose your option: ",
-                     choices=["Retry", "Abort"])
-            if answer == "Abort":
-                console.print("[yellow].. Ending current run ..[/yellow]")
-                sys.exit(1)
-            else:
-                api_key = Prompt.ask("Please enter a Gemini api key").strip()
-
-
-async def async_main():
-
-
-    ## add in all argument parser stuff:
-    parser = argparse.ArgumentParser(description="Assemble images of a physical article or PhD into a .pdf, and translate into English")
-    parser.add_argument("--model", default="gemini-3.5-flash-lite")
-    parser.add_argument("--image_directory")
-    parser.add_argument("--pdf_path")
-    parser.add_argument("--language", type=str)
-    parser.add_argument("--batches", default=1, type=int)
-    parser.add_argument("--retries_allowed", default=3, type=int)
-    parser.add_argument("--change_api_key", action="store_true")
-    parser.add_argument("--free_tier_llm", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--concurrent", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--type", type=str, default="images")
-    parser.add_argument("--input_pdf_path")
-
-    run_usage = []
-    footnotes = []
-
-    args = parser.parse_args()
-
-    
-
-    if args.change_api_key:
-        change_api_key() ## do code for this, then return
-        sys.exit(1)
-    
-    ## i need to ensure required argParser attributes are present, depending on whether images or pdf mode
-
-    ## otherwise, check all fields that need to be required were provided
-    required_args_missing = [name for name in ("language", "pdf_path") if getattr(args, name) is None]
-    if required_args_missing:
-        console.print(f"[red].. required flags for CLI were missing: {required_args_missing} ..[/red]")
-        sys.exit(1)
-
-    task_type = args.type
-    if task_type != "pdf" and task_type != "images":
-        console.print(f"[red].. task_type provided: {task_type} - is not a valid task_type ..[/red]")
-        sys.exit(1)
-
-    if task_type == "images":
-        ## make sure required args exist, otherwise exist in error
-        required_args_missing = getattr(args, "image_directory") is None
-        if required_args_missing:
-            console.print(f"[red].. required flags for CLI were missing: {required_args_missing} ..[/red]")
-            sys.exit(1)
-    elif task_type == "pdf":
-        required_args_missing = getattr(args, "input_pdf_path") is None
-        if required_args_missing:
-            console.print(f"[red].. required flags for CLI were missing: {required_args_missing} ..[/red]")
-            sys.exit(1)
-
-    
-
-    ## need to pass client down to LLM calls
-    client = validation_gemini_api_key_loop()
-
-    ## add in BATCHE_PAGES, conditional based on batch_size - default 1, if above 1 then should be True
-    BATCH_PAGES = None
-    if args.batches > 1:
-        BATCH_PAGES = True
-    else:
-        BATCH_PAGES = False
-
-
-    ## HERE - conditional between type for images input or pdf input
-    if args.type == "pdf":
-        try:
-            pdf_path = find_pdf_file(args.input_pdf_path)
-            pdf_images = get_images_from_pdf(pdf_path)
-            await rest_of_functionality(pdf_images, args, BATCH_PAGES, client)
-            ## then normal workflow after
-        except (FileNotFoundError) as e:
-            print(e)
-            sys.exit(1) ## exit CLI
-        ## need the workflow for assembling images from the pdf
-    else:
-        ## replace this wih a proper 'find_image_directory() function
-        try:
-            image_directory = find_image_directory(args.image_directory) #
-        except (FileNotFoundError, NotADirectoryError) as e:
-            print(e)
-            sys.exit(1) ## exit CLI
-
-        images_to_convert: list[Path] = []
-
-        token_usage = []
-
-        image_directory_files = list(image_directory.iterdir())
-    
-        console.print("[yellow].. Searching for images in image directory ..[/yellow]")
-        for file in tqdm(image_directory_files, desc="..Finding images in image directory.."):
-        #print(f"file is: {file}")
-            if file.is_file():
-                if file.suffix.lower() in {".png", ".jpg", ".jpeg"}:
-                    console.print(f"[yellow].. Valid file found: {file} ..[/yellow]")
-                    images_to_convert.append(file)
-
-        if images_to_convert is None:
-            console.print("[red].. No images found - ending run ..[/red]")
-            sys.exit(1)
-        console.print("[green].. Images found for image directory ..[/green]")
-        
-        ## sort images_to_convert by end of file name
-        console.print("[green].. sorting images into correct page order by file name ..[/green]")
-        images_to_convert.sort(key=lambda image: int(image.name.split("_")[2].split(".")[0]))
-        
-        ## need to pass down something that gets
-
-        ## add in split based on batches
-        if BATCH_PAGES:
-            # batch pages function
-            console.print("[green].. User has chosen to batch images ..[/green]")
-            if args.concurrent:
-                console.print("[green].. Running batch translation concurrently ..[/green]")
-                translated_text, failed_after_retries = await extract_text_and_translate_batch(images_to_convert, token_usage, args.batches, args.model, args.language, args.retries_allowed, run_usage, client, args.free_tier_llm) ## pass batch size
-            else:
-                console.print("[green].. Running batch translation sequentially ..[/green]")
-                translated_text, failed_after_retries = await extract_text_and_translate_batch_sequential(images_to_convert, token_usage, args.batches, args.model, args.language, args.retries_allowed, run_usage, client, args.free_tier_llm) ## pass batch size
-            if failed_after_retries:
-                console.print("[red].. translation failed after retries ..[/red]")
-                sys.exit(1)
-            console.print("[green].. (Batch) Images extracted and translated ..[/green]")
-        else:
-            ## existing version
-            console.print("[green].. User has chosen default batch size of 1 ..[/green]")
-            if args.concurrent:
-                console.print("[green].. Running page translation concurrently ..[/green]")
-                translated_text, failed_after_retries = await extract_text_and_translate(images_to_convert, token_usage, args.model, args.language, args.retries_allowed, run_usage, client, args.free_tier_llm)
-            else:
-                console.print("[green].. Running page translation sequentially ..[/green]")
-                translated_text, failed_after_retries = await extract_text_and_translate_sequential(images_to_convert, token_usage, args.model, args.language, args.retries_allowed, run_usage, client, args.free_tier_llm)
-            if failed_after_retries:
-                console.print("[red].. translation failed after retries ..[/red]")
-                sys.exit(1)
-            console.print("[green].. Images extracted and translated ..[/green]")
-            
-
-                
-        from decimal import Decimal
-                
-        total_input_tokens = sum(token_count(row.get("input_tokens", 0)) for row in run_usage)
-        total_output_tokens = sum(token_count(row.get("output_tokens", 0)) for row in run_usage)
-        total_thought_tokens = sum(token_count(row.get("thought_tokens", 0)) for row in run_usage)
-        total_tokens = sum(token_count(row.get("total_tokens", 0)) for row in run_usage)
-        console.print(f"[yellow].. Total Input Tokens used: {total_input_tokens} ..[/yellow]")
-        console.print(f"[yellow].. Total Output Tokens used: {total_output_tokens} ..[/yellow]")
-        console.print(f"[yellow].. Total Thought Tokens used: {total_thought_tokens} ..[/yellow]")
-        console.print(f"[yellow].. Total Tokens used: {total_tokens} ..[/yellow]")
-        cost = (total_input_tokens * 0.0000003) + (total_output_tokens * 0.0000025) + (total_thought_tokens * 0.0000025) # $0.30 per 1m input, $2.50 per 1m output
-        amount = Decimal(str(cost))
-        console.print(f"[yellow].. Total Token Cost: ${amount:.2f} ..[/yellow]")
-
-        total_attempts = len(run_usage)
-        failed_attempts = sum(1 for row in run_usage if not row["success"])
-        successful_attempts = sum(1 for row in run_usage if row["success"])
-
-        retried_pages = sorted({
-            row["page"]
-            for row in run_usage
-            if row["mode"] == "single" and row["attempt"] > 1
-        })
-
-        retried_batches = sorted({
-            row["batch"]
-            for row in run_usage
-            if row["mode"] == "batch" and row["attempt"] > 1
-        })
-
-        console.print(f"[yellow].. Total Gemini attempts: {total_attempts} ..[/yellow]")
-        console.print(f"[yellow].. Successful Gemini attempts: {successful_attempts} ..[/yellow]")
-        console.print(f"[yellow].. Failed Gemini attempts: {failed_attempts} ..[/yellow]")
-        console.print(f"[yellow].. Retried pages: {retried_pages or 'None'} ..[/yellow]")
-        console.print(f"[yellow].. Retried batches: {retried_batches or 'None'} ..[/yellow]")
-
-            # £0.00430 per page, roughly - for english pdfs - what about foreign languages?
-            
-            ## should be able to fix footnote continuations out of order, based purely on what correct footnumber should be
-        console.print("[green].. Fixing any PDF footnotes that span pages ..[/green]")
-        for i, page in enumerate(translated_text):
-
-            translated_footnotes = page.translated_footnotes or []
-            if translated_footnotes: ##possibly a page might not have footnotes
-                #print(f"-- page {i} has translated_footnotes! --")
-                any_footnote_continuations = any(footnote.continuation_previous_footnote for footnote in translated_footnotes )
-                if any_footnote_continuations:
-                    ## need to create list of all footnotes
-                    footnote_continuations = [footnote for footnote in translated_footnotes if footnote.continuation_previous_footnote == True ]
-
-                    for footnote_c in footnote_continuations:
-                        footnotes.append({
-                            "footnote_contination": True,
-                            "footnote_continuation_number": footnote_c.continuation_previous_footnote_number
-                            })
-
-
-                        found_match = False
-                        target_footnote = footnote_c.continuation_previous_footnote_number
-                        if target_footnote is None:
-                            continue
-                    
-                                ## go through all other pages
-                        for ix, pageN in enumerate(translated_text): 
-                            if ix == i:
-                                continue ## don't want to loop through current page
-                            footnotes = pageN.translated_footnotes or []
-                            if footnotes:
-                                for prev in footnotes:
-                                    if prev.number == target_footnote:
-                                        prev.footnote_text = f"{prev.footnote_text.rstrip()} {footnote_c.footnote_text.lstrip()}"
-                                        page.translated_footnotes.remove(footnote_c)
-                                        found_match = True
-                                        break
-
-                            if found_match:
-                                break
-                            
-                            
-        footnote_continuation_total = sum(1 for footnote in footnotes)
-        console.print(f"[yellow].. No. of footnotes spanning multiple pages: {footnote_continuation_total} ..[/yellow]")
-
-
-
-            
-
-        ## make page_number and rest of pydantic into equal-level tuple
-        ready_to_assemble = [(chunk.page_number, (chunk.translated_main_text, chunk.translated_footnotes or "")) for chunk in translated_text]
-        ## then sort by page number
-        ready_to_assemble = infer_page_numbers(ready_to_assemble) ## add in any page number gaps, on presumption that page order is correct
-        console.print("[green].. Any PDF page gaps filled-in ..[/green]")
-        ready_to_assemble.sort(key=lambda item: item[0])
-        console.print("[green].. PDF ordered by pages ..[/green]")
-
-            
-
-        ## then, fix any footnotes that are contiuations of previous ones
-
-        ## order is determined by image file name - presumes images were taken in order from start to end of article/phd
-
-        #print(f"ready_to_assemble is: {ready_to_assemble}")
-
-        ## find title
-        title = ""
-        for chunk in translated_text:
-            if chunk.title:
-                title += chunk.title
-                break
-            else:
-                continue
-
-        console.print(f"[green].. title of article or PhD is: {title} ..[/green]")
-
-            ## then need to add in pdf creation code
-        doc = SimpleDocTemplate(
-            args.pdf_path,
-            pagesize=A4,
-            leftMargin=2.2 * cm,
-            rightMargin=2.2 * cm,
-            topMargin=2.2 * cm,
-            bottomMargin=2.5 * cm,
-            title=title,
-            )
-        
-        styles = getSampleStyleSheet()
-        body_style = ParagraphStyle(
-            "Body",
-            parent=styles["Normal"],
-            fontName="Times-Roman",
-            fontSize=11,
-            leading=15,
-        )
-            
-        foot_style = ParagraphStyle(
-            "Footnote",
-            parent=styles["Normal"],
-            fontName="Times-Roman",
-            fontSize=9,
-            leading=12,
-        )
-        
-        title_style = ParagraphStyle(
-            "Title",
-            parent=styles["Title"],
-            fontName="Times-Roman",
-            fontSize=16,
-            leading=20,
-            spaceAfter=12,
-        )
-
-        story: List[Any] = [Paragraph(title, title_style)]
-
-        def add_paragraphs(story: List[Any], style: ParagraphStyle, text: str) -> None:
-            for para in [p.strip() for p in text.split("\n\n")]:
-                if not para:
-                    continue
-                story.append(Paragraph(convert_markers_to_sup(para), style))
-                story.append(Spacer(1, 6))
-        
-        def convert_markers_to_sup(text: str) -> str:
-            out = []
-            i = 0
-            while i < len(text):
-                if text.startswith("[^", i):
-                    j = text.find("]", i)
-                    if j != -1:
-                        marker = text[i + 2:j]
-                        out.append(f"<super>{marker}</super>")
-                        i = j + 1
-                        continue
-                out.append(text[i])
-                i += 1
-            return "".join(out)
-
-
-        def add_footnotes(story: List[Any], style: ParagraphStyle, footnotes: List[Footnote]) -> None:
-            if not footnotes:
-                return
-            items = []
-            story.append(Spacer(1, 6))
-            for note in footnotes:
-                number = note.number if note.number is not None else ""
-                para = Paragraph(f"{number}. {note.footnote_text or ""}", style)
-                story.append(para)
-                story.append(Spacer(1, 4))
-
-        for page_number, translated_chunks in ready_to_assemble:
-            main_text, footnotes = translated_chunks
-            add_paragraphs(story, body_style, main_text)
-            add_footnotes(story, foot_style, footnotes)
-            story.append(PageBreak())
-
-        if story and isinstance(story[-1], PageBreak):
-            story = story[:-1]
-
-        console.print("[green]... Rendering PDF... [/green]")
-        doc.build(story)
-        console.print("[green]... PDF Ready... [/green]")
-        console.print(f"[green]... New PDF saved to: {args.pdf_path}... [/green]")
-
-
-def main():
-    asyncio.run(async_main())
-
-if __name__ == "__main__":
-    main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
